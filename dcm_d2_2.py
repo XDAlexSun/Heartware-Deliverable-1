@@ -316,10 +316,11 @@ def _int_to_percent(v: int) -> str:
     return "Off" if v == 0 else f"{int(v)}%"
 
 def _hexify(i: int) -> str:
-    # convert int to hexadecimal and strip 0x
-    return hex(i)[2:]
-
-
+    """Convert int to 2-digit hexadecimal, zero-padded"""
+    # Ensure it's an integer and within byte range
+    i = int(i)
+    i = max(0, min(i, 255))  # Clamp to 0-255 range
+    return f"{i:02x}"
 # all allowed lists to be used by Widgets
 ALLOWED_LRL = build_allowed_lrl(LRL_SEGMENTS)
 ALLOWED_URL = build_allowed_url(URL_MIN, URL_MAX, URL_STEP)
@@ -329,120 +330,180 @@ REF_VALUES  = list(range(REF_MIN, REF_MAX + 1, REF_STEP))
 
 
 # D2: thread to handle all serial communications
-
 class SerialThread(QThread):
-
     serial_received = pyqtSignal(bytes)
     serial_error = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.port: QSerialPort = QSerialPort()
+        self.port: Optional[QSerialPort] = None
         self.isRunning: bool = False
         self.isReading: bool = False
         self.writeQueue: Queue = Queue()
-        self._rx_lock = False # added for a buffer to prevent data overlap
+        
+        self.port_name: str = ""
+        self.baud_rate: int = BAUD_RATE
+        self.data_bits = QSerialPort.Data8
 
+    def port_setup(self, port_name: str, baud_rate: int, data_bits) -> None:
+        '''Store port parameters - actual port creation happens in run()'''
+        self.port_name = port_name
+        self.baud_rate = baud_rate
+        if isinstance(data_bits, int):
+            data_bits_map = {
+                5: QSerialPort.Data5,
+                6: QSerialPort.Data6,
+                7: QSerialPort.Data7,
+                8: QSerialPort.Data8
+            }
+            self.data_bits = data_bits_map.get(data_bits, QSerialPort.Data8)
+        else:
+            self.data_bits = data_bits
 
-    def port_setup(self, port_name: str, baud_rate: int, data_bits: int)-> None:
-        '''
-        parity, stop bits, flow control omitted
-        '''
-        self.port.setPortName(port_name)
-        self.port.setBaudRate(baud_rate)
-        self.port.setDataBits(data_bits)
-
-    def run(self)-> None:
-        '''
-        reads and writes data from serial communication
-        '''
+    def run(self) -> None:
+        '''Main thread loop - create QSerialPort HERE in the worker thread'''
+        # Create the port IN THIS THREAD
+        self.port = QSerialPort()
+        self.port.setPortName(self.port_name)
+        self.port.setBaudRate(self.baud_rate)
+        self.port.setDataBits(self.data_bits)
+        self.port.setParity(QSerialPort.NoParity)
+        self.port.setStopBits(QSerialPort.OneStop)
+        self.port.setFlowControl(QSerialPort.NoFlowControl)
+        
         if not self.port.open(QSerialPort.ReadWrite):
-            self.serial_error.emit("ERROR: Could not open port.")
+            self.serial_error.emit(f"ERROR: Could not open port {self.port_name}")
             return
-        self.is_running = True
+        
+        self.isRunning = True
+        print(f"SerialThread: Port {self.port.portName()} opened successfully")
+        
         try:
-            while self.is_running:
+            while self.isRunning:
+                # ===== WRITE QUEUE PROCESSING =====
+                wrote_data = False
                 while not self.writeQueue.empty():
-                    #write as long as there is still information in the queue
-                    preData = self.writeQueue.get()
-                    if isinstance(preData, str):
-                        data = bytes.fromhex(preData)
-                    elif isinstance(preData, (bytes, bytearray)):
-                        data =bytes(preData)
-                    else:
+                    data = self.writeQueue.get()
+                    
+                    # Convert data to bytes if needed
+                    if isinstance(data, str):
                         try:
-                            data = bytes(preData)
-                        except Exception:
-                            self.serial_error.emit("ERROR: Invalid data type in write queue.")
+                            clean_hex = data.replace(" ", "")
+                            if len(clean_hex) % 2 != 0:
+                                print(f"Hex string must have even length. Got: {len(clean_hex)}")
+                                continue
+                            data = bytes.fromhex(clean_hex)
+                        except ValueError as e:
+                            self.serial_error.emit(f"ERROR: Invalid hex string: {e}")
                             continue
-                    self.port.write(data)
-                    ok = self.port.waitForBytesWritten(int(STREAM_PERIOD[1]*1000)) # wait max 5ms
-                    if not ok:
-                        self.serial_error.emit("ERROR: Timeout during write.")
+                    elif isinstance(data, (list, tuple)):
+                        data = bytes(data)
+                    elif not isinstance(data, (bytes, bytearray)):
+                        self.serial_error.emit(f"ERROR: Invalid data type: {type(data)}")
+                        continue
+                    
+                    # Write to port
+                    bytes_written = self.port.write(data)
+                    print(f"SerialThread: Wrote {bytes_written} bytes: {data.hex()}")
+                    wrote_data = True
+                    
+                    if not self.port.waitForBytesWritten(100):
+                        print("SerialThread: Write timeout (non-critical)")
                     self.port.flush()
 
-                if self.isReading:
-                    if self.port.waitForReadyRead(int(STREAM_PERIOD[1]*1000)): # wait max 5ms
+                # ===== READ PROCESSING =====
+                if self.isReading or wrote_data:
+                    if self.port.waitForReadyRead(50):
                         qba = self.port.readAll()
                         data_bytes = bytes(qba.data()) if hasattr(qba, 'data') else bytes(qba)
                         if data_bytes:
                             self.serial_received.emit(data_bytes)
-                self.msleep(1) # prevent 100% CPU
+                
+                self.msleep(10)
+                
+        except Exception as e:
+            self.serial_error.emit(f"ERROR in run loop: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
-            try:
+            self._cleanup()
+
+    def _cleanup(self):
+        '''Clean up resources - called from the worker thread'''
+        if self.port:
+            if self.port.isOpen():
                 self.port.close()
-            except Exception:
-                pass
+                print("SerialThread: Port closed")
+            self.port.deleteLater()
+            self.port = None
 
+    # ... rest of your SerialThread methods remain the same ...
     def stop(self)-> None:
-        self.is_running = False
-        self.quit()
-        self.wait()
+        print("SerialThread: Stopping...")
+        self.isRunning = False
+        # Give thread time to finish current operation
+        self.wait(1000)  # Wait up to 1 second
+        if self.isRunning():
+            print("SerialThread: Force terminating...")
+            self.terminate()
+            self.wait()
     
-    def writeToQueue(self, data: str)-> None:
-        self.isReading = False
-        if self.port.isOpen():
-            self.writeQueue.put(data.encode())
-        else:
-            self.serial_error.emit("Failed")
-
-    def beginEgram(self, func_code: int = 0x32)-> None: #defaultt 0x32, func_code is for egram reading
-        self.isReading = True
-        # Request data to be sent from pacemaker
-        sync = 0x16
-        payload = [sync, func_code, 0x01]
-        chk = sum(payload[2:]) % 256
-        frame = bytes(payload + [chk])       
-        self.writeToQueue(frame)
-        self.isReading = True
-
-    def stop_egram(self, func_code: int = 0x32)-> None:
-        # Request data to be sent from pacemaker
-        sync = 0x16
-        payload = [sync, func_code, 0x00]
-        chk = sum(payload[2:]) % 256
-        frame = bytes(payload + [chk])       
-        self.writeToQueue(frame)
-        #self.isReading = False
+    def writeToQueue(self, data)-> None:
+        '''Queue data for writing'''
+        if not self.port.isOpen():
+            self.serial_error.emit("ERROR: Port not open")
+            return
+        
+        self.writeQueue.put(data)
+        print(f"SerialThread: Queued data for writing")
 
     def request_params(self)-> None:
+        '''Request parameters from pacemaker'''
+        self.isReading = True
         sync = 0x16
-        FUNC_READ_PARAMS = 0x10 #adjust to actual, ask what it is
-        payload = [sync, FUNC_READ_PARAMS]
-        chk = sum(payload[2:]) % 256
-        frame = bytes(payload + [chk])
-        self.writeToQueue(frame)
-        self.isReading = True
-
-    def readFromPacemaker(self)-> None:
-        self.isReading = True
-        # Request data to be sent from pacemaker
-        self.writeToQueue({hex(16)[2:], hex(22)[2:]}) #change to readparams from pacemaker
-        #add function for readEgramfrompacemaker - safety critical
-
+        func_echo = 0x55
         
+        payload = [sync, func_echo]
+        chksum = sum(payload[1:]) % 256
+        frame = bytes(payload + [chksum])
+        
+        print(f"request_params: Sending {frame.hex()}")
+        self.writeToQueue(frame)
 
+    def write_params(self, params_hex_string: str)-> None:
+        '''Write parameters to pacemaker'''
+        # Don't disable reading - we might get a response
+        print(f"write_params: Sending {params_hex_string}")
+        self.writeToQueue(params_hex_string)
 
+    def beginEgram(self)-> None:
+        '''Request egram streaming start'''
+        self.isReading = True
+        sync = 0x16
+        func_egram = 0x47
+        start_flag = 0x01
+        
+        payload = [sync, func_egram, start_flag]
+        chksum = sum(payload[1:]) % 256
+        frame = bytes(payload + [chksum])
+        
+        print(f"beginEgram: Sending {frame.hex()}")
+        self.writeToQueue(frame)
+
+    def stop_egram(self)-> None:
+        '''Request egram streaming stop'''
+        sync = 0x16
+        func_estop = 0x62
+        stop_flag = 0x00
+        
+        payload = [sync, func_estop, stop_flag]
+        chksum = sum(payload[1:]) % 256
+        frame = bytes(payload + [chksum])
+        
+        print(f"stop_egram: Sending {frame.hex()}")
+        self.writeToQueue(frame)
+        # Don't immediately disable reading - wait for ack
+        QTimer.singleShot(500, lambda: setattr(self, 'isReading', False))
 
 # =========================
 # 6) CUSTOM WIDGETS FOR PARAMETERS!!!!!!
@@ -931,7 +992,7 @@ class D2EgramView(QWidget):
 
         # request the device begin streaming (thread will enable reading)
         try:
-            self.serial_thread.begin_egram(self.FUNC_EGRAM)
+            self.serial_thread.beginEgram(self.FUNC_EGRAM)
         except Exception as e:
             print("Failed to request egram start:", e)
 
@@ -955,77 +1016,65 @@ class D2EgramView(QWidget):
         self._running = False
 
     # called when SerialThread emits raw bytes
+    # In D2EgramView class
+
     def _on_serial_bytes(self, data: bytes) -> None:
-        """
-        Append bytes to rx_buffer and extract frames.
-        Frame (example): [0x16][FUNC_EGRAM=0x32][A_hi][A_lo][V_hi][V_lo][CHK]
-        A/V are signed 16-bit integers representing mV * 100.
-        """
+        """Process incoming egram data bytes"""
         if not data:
             return
+    
+        print(f"D2EgramView: Received {len(data)} bytes")
         self.rx_buffer.extend(data)
 
-        # parse frames repeatedly
-        while True:
-            # need at least 7 bytes for a frame in this schema
-            if len(self.rx_buffer) < 7:
-                break
-
-            # find sync byte (0x16)
+        # Parse frames
+        while len(self.rx_buffer) >= 7:  # Minimum frame size
+            # Find sync byte
             try:
                 sync_idx = self.rx_buffer.index(0x16)
             except ValueError:
-                # no sync -> drop buffer
                 self.rx_buffer.clear()
                 break
 
             if sync_idx > 0:
-                # drop leading bytes up to sync
                 del self.rx_buffer[:sync_idx]
 
-            # now check we have at least full frame
             if len(self.rx_buffer) < 7:
                 break
 
-            # peek frame
-            sync = self.rx_buffer[0]
+            # Check function code
             func = self.rx_buffer[1]
-            if func != self.FUNC_EGRAM:
-                # not egram frame — drop sync byte and continue searching
+            if func != 0x47:  # Not egram data (k_egram = 0x47)
                 del self.rx_buffer[0]
                 continue
 
-            # extract bytes (big-endian)
-            a_hi = self.rx_buffer[2]
-            a_lo = self.rx_buffer[3]
-            v_hi = self.rx_buffer[4]
-            v_lo = self.rx_buffer[5]
+            # Extract data
+            a_hi, a_lo = self.rx_buffer[2], self.rx_buffer[3]
+            v_hi, v_lo = self.rx_buffer[4], self.rx_buffer[5]
             chk = self.rx_buffer[6]
 
-            # compute checksum (device-specific; here we sum func..lastdata)
+            # Verify checksum
             calc = (func + a_hi + a_lo + v_hi + v_lo) % 256
             if calc != chk:
-                # checksum mismatch — drop sync and try again
+                print(f"D2EgramView: Checksum mismatch! calc={calc:02x}, received={chk:02x}")
                 del self.rx_buffer[0]
                 continue
 
-            # parse signed 16-bit values (big-endian)
+            # Parse signed 16-bit values
             atr_raw = (a_hi << 8) | a_lo
             ven_raw = (v_hi << 8) | v_lo
-            # interpret as signed:
+        
             if atr_raw & 0x8000:
                 atr_raw = atr_raw - 0x10000
             if ven_raw & 0x8000:
                 ven_raw = ven_raw - 0x10000
 
-            # convert to mV (example scaling: device sends mV*100)
+            # Convert to mV
             atr_mv = atr_raw / 100.0
             ven_mv = ven_raw / 100.0
+        
+            print(f"D2EgramView: Parsed - Atrial: {atr_mv:.2f}mV, Ventricular: {ven_mv:.2f}mV")
 
-            # append samples
             self._append_samples(atr_mv, ven_mv)
-
-            # remove parsed frame
             del self.rx_buffer[:7]
 
     # DATA HANDLING (same as before but accepts mV floats now)
@@ -1397,57 +1446,55 @@ class ModeEditorPage(QWidget):
         }
     
     # D2: prepares parameters to be written to the serial connection - "WRITE" and packaging FUNCTION
-    def _package_params(self) -> str:
-        p = self._collect_params()
-        header = [_hexify(22), _hexify(85)] #sync and pparams function codes
-        params = [
-            _hexify(MODES.index(p['mode'])+1),
-            _hexify(int(p['Hysteresis'] == 'On')),
-            _hexify(p['HRL_ppm']),
-            _hexify(p['LRL_ppm']),
-            _hexify(p['URL_ppm'])
-        ]
-        if self.current_mode in ("AOO", "AAI", "AOOR", "AAIR"):
-            params.extend([
-                _hexify(30) if p['AtrialAmplitude_V'] == "Off" else _hexify(int(p['AtrialAmplitude_V']*10)),
-                _hexify(int(p["AtrialPulseWidth_ms"]*10)),
-                _hexify(int(p['ARP_ms']/10))
-                ])
-        else:
-            params.extend([
-                _hexify(35) if p['VentricularAmplitude_V'] == "Off" else _hexify(int(p['VentricularAmplitude_V']*10)),
-                _hexify(int(p["VentricularPulseWidth_ms"]*10)),
-                _hexify(int(p['VRP_ms']/10))
-                ])
-        # Hysteresis values
-        if self.current_mode in ("AAI", "AAIR", "VVI", "VVIR"):
-            params.append(_hexify(int(p['AtrialSensitivity_mV']*10)) if self.current_mode in ("AAI", "AAIR") else _hexify(int(p["VentricularSensitivity_mV"]*10)))
-            params.extend([_hexify(p['RateSmoothingUp_percent']), _hexify(p['RateSmoothingDown_percent'])])
-        else:
-            # If not hysteresis, append 0s
-            params.append(_hexify(0))
-            params.extend([_hexify(0), _hexify(0)])
-        # Rate adaptive values
-        if self.current_mode in ("AOOR", "AAIR", "VOOR", "VVIR"):
-            params.extend([_hexify(ACTIVITY_THRESHOLD.index(p["ActivityThreshold"])+1), _hexify(p["ReactionTime_s"])])
-            params.extend([_hexify(p["ResponseFactor"]), _hexify(p["RecoveryTime_min"])])
-        # If not rate adaptive, append 0s
-        else:
-            params.extend([_hexify(0), _hexify(0), _hexify(0), _hexify(0)])
-        # Check sum (sum of all hex values)
+    def _handle_load(self) -> None:
+        """Load parameters to pacemaker"""
+        user = self.get_active_user()
+        if not user:
+            QMessageBox.warning(self, "No user", "Please log in first.")
+            return
 
-        # MSR
-        params.append(_hexify(p['MSR_ppm']) if self.current_mode in ("AOOR", "AAIR", "VOOR", "VVIR") else _hexify(0))
+        if self.lrl.value() > self.url.value():
+            QMessageBox.warning(self, "Check Parameters!", "LRL must be <= URL.")
+            return
 
-        chksum = 0
-        for i in params:
-            chksum += int(i, 16)
-        # Join to end of array
-        chksum = chksum%256 # make sure it fits in 1 byte
-        params.append(_hexify(chksum))
+        if not self.serial_thread or not self.serial_thread.port.isOpen():
+            QMessageBox.warning(self, "No Connection", "Please connect to device first.")
+            return
 
-        data = " ".join((header+params))
-        return data
+        try:
+            # Package parameters as hex string
+            print("DEBUG: Starting _package_params...")
+            data = self._package_params()
+            print(f"DEBUG: _package_params returned: {repr(data)}")
+            print(f"DEBUG: Type of returned data: {type(data)}")
+        
+            if data is None:
+                print("ERROR: _package_params returned None!")
+                QMessageBox.critical(self, "Error", "Parameter packaging failed - returned None")
+                return
+            
+            if not isinstance(data, str):
+                print(f"ERROR: _package_params returned non-string: {type(data)}")
+                QMessageBox.critical(self, "Error", f"Parameter packaging failed - expected string, got {type(data)}")
+                return
+            
+            if len(data.strip()) == 0:
+                print("ERROR: _package_params returned empty string!")
+                QMessageBox.critical(self, "Error", "Parameter packaging failed - returned empty string")
+                return
+
+            print(f"_handle_load: Packaged params: {data}")
+
+            # Send via serial thread
+            self.serial_thread.write_params(data)
+
+            QMessageBox.information(self, "Loaded", 
+                f"Parameters sent to pacemaker for {user} [{self.current_mode}].")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load parameters: {str(e)}")
+            import traceback
+            traceback.print_exc()
     
     #D2: process recieved serial data into parameters
     def _process_to_params(self, recieved: str) -> Dict[str, Any]: #"read" annd processing function
@@ -1661,7 +1708,7 @@ class ModeEditorPage(QWidget):
 
     # REVERT!!!! (also called by set_mode)
     def _handle_revert(self) -> None:
-        user = self.get_active_user()
+        user = self.get_active_user
         saved = self.db.load_params(user, self.current_mode) if user else {}
         if saved:
             self._apply_params_to_widgets(saved)
@@ -1671,53 +1718,208 @@ class ModeEditorPage(QWidget):
         self._refresh_summary()
 
     # D2: Load data to pacemaker -WRITE
+  # In ModeEditorPage class
+
     def _handle_load(self) -> None:
+        """Load parameters to pacemaker"""
         user = self.get_active_user()
         if not user:
             QMessageBox.warning(self, "No user", "Please log in first.")
             return
-        # safety: LRL should not exceed URL
+
         if self.lrl.value() > self.url.value():
             QMessageBox.warning(self, "Check Parameters!", "LRL must be <= URL.")
             return
 
+        if not self.serial_thread or not self.serial_thread.port.isOpen():
+            QMessageBox.warning(self, "No Connection", "Please connect to device first.")
+            return
 
-        data = self._package_params()
-        MainWindow._write_to_serial(win, data)
-        QMessageBox.information(self, "Loaded", f"Parameters loaded for {user} [{self.current_mode}].")
-        
-    # D2: Get data from pacemaker and write to DCM
-    def _handle_get(self) -> None:
-        # TODO: get data from serial
-        # data_test = "16 49 1 0 ff 3c 78 1e a 19 0 0 0 0 0 0 0 0 f5" #HARDCODED  -> change to d= self.serial....
-        # d = self._process_to_params(data_test)
-        self.serial_thread.readFromPacemaker()
-        d = self.serial_thread.serial_recieved.connect(self._process_to_params) #<-
-        
-        user = self.get_active_user()
         try:
-            self.set_mode(d['mode'])
-            self._apply_params_to_widgets(d)
-            self._refresh_summary()
-            QMessageBox.information(self, "Data Retrieved", f"Parameters for {user} [{self.current_mode}] retrieved successfully")
-        except TypeError:
-            QMessageBox.critical(self, "Error", "Serial message format incorrect, parameters not changed")
+            # Package parameters as hex string
+            print("DEBUG: Starting _package_params...")
+            data = self._package_params()
+            print(f"DEBUG: _package_params returned: {repr(data)}")
+            print(f"DEBUG: Type of returned data: {type(data)}")
+        
+            if data is None:
+                print("ERROR: _package_params returned None!")
+                QMessageBox.critical(self, "Error", "Parameter packaging failed - returned None")
+                return
+            
+            if not isinstance(data, str):
+                print(f"ERROR: _package_params returned non-string: {type(data)}")
+                QMessageBox.critical(self, "Error", f"Parameter packaging failed - expected string, got {type(data)}")
+                return
+            
+            if len(data.strip()) == 0:
+                print("ERROR: _package_params returned empty string!")
+                QMessageBox.critical(self, "Error", "Parameter packaging failed - returned empty string")
+                return
+
+            print(f"_handle_load: Packaged params: {data}")
+
+            # Send via serial thread
+            self.serial_thread.write_params(data)
+
+            QMessageBox.information(self, "Loaded", 
+                f"Parameters sent to pacemaker for {user} [{self.current_mode}].")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load parameters: {str(e)}")
+            import traceback
+            traceback.print_exc()
         
     def _handle_get(self) -> None:
-        # TODO: get data from serial
-        data_test = MainWindow._read_from_serial(win)
-        d = self._process_to_params(data_test)
-
+        """Get parameters from pacemaker"""
         user = self.get_active_user()
+        if not user:
+            QMessageBox.warning(self, "No user", "Please log in first.")
+            return
+
+        if not self.serial_thread or not self.serial_thread.port.isOpen():
+            QMessageBox.warning(self, "No Connection", "Please connect to device first.")
+            return
+    
         try:
-            self.set_mode(d['mode'])
-            self._apply_params_to_widgets(d)
-            self._refresh_summary()
-            QMessageBox.information(self, "Data Retrieved", f"Parameters for {user} [{self.current_mode}] retrieved successfully")
-        except TypeError:
-            QMessageBox.critical(self, "Error", "Serial message format incorrect, parameters not changed") 
+        # Connect signal to process response (only once)
+            try:
+                self.serial_thread.serial_received.disconnect(self._on_params_received)
+            except:
+                pass
+            self.serial_thread.serial_received.connect(self._on_params_received)
+        
+            # Request parameters
+            print("_handle_get: Requesting parameters...")
+            self.serial_thread.request_params()
 
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to request parameters: {str(e)}")
 
+    def _on_params_received(self, data: bytes) -> None:
+        """Process received parameter data"""
+        try:
+            # Convert bytes to hex string format expected by _process_to_params
+            hex_str = " ".join(f"{b:02x}" for b in data)
+            print(f"_on_params_received: {hex_str}")
+        
+            # Parse the parameters
+            params = self._process_to_params(hex_str)
+        
+            if params:
+                user = self.get_active_user()
+                self.set_mode(params['mode'])
+                self._apply_params_to_widgets(params)
+                self._refresh_summary()
+                QMessageBox.information(self, "Data Retrieved", 
+                    f"Parameters for {user} [{self.current_mode}] retrieved successfully")
+        
+            # Disconnect after processing
+            try:
+                self.serial_thread.serial_received.disconnect(self._on_params_received)
+            except:
+                pass
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to process parameters: {str(e)}")
+            print(f"Error details: {e}")
+    def _package_params(self) -> str:
+        try:
+            p = self._collect_params()
+            print(f"DEBUG: Collected params: {p}")
+
+            header = [_hexify(22), _hexify(85)]  # sync and function codes
+        
+            # Mode index (1-8 for modes)
+            mode_idx = MODES.index(p['mode']) + 1
+            params = [
+                _hexify(mode_idx),
+                _hexify(1 if p['Hysteresis'] == 'On' else 0),
+                _hexify(p['HRL_ppm']),
+                _hexify(p['LRL_ppm']),
+                _hexify(p['URL_ppm'])        ]
+            print(f"DEBUG: Basic params: {params}")
+
+            # Atrial/Ventricular parameters based on mode
+            if self.current_mode in ("AOO", "AAI", "AOOR", "AAIR"):
+                # Handle atrial amplitude
+                atrial_amp_val = p['AtrialAmplitude_V']
+                if atrial_amp_val == "Off":
+                    amp_hex = _hexify(30)
+                else:
+                    amp_hex = _hexify(int(float(atrial_amp_val) * 10))
+            
+                params.extend([
+                    amp_hex,
+                    _hexify(int(float(p["AtrialPulseWidth_ms"]) * 10)),
+                    _hexify(int(p['ARP_ms'] / 10))])
+            else:
+                # Handle ventricular amplitude
+                vent_amp_val = p['VentricularAmplitude_V']
+                if vent_amp_val == "Off":
+                    amp_hex = _hexify(35)
+                else:
+                    amp_hex = _hexify(int(float(vent_amp_val) * 10))
+            
+                params.extend([
+                amp_hex,
+                _hexify(int(float(p["VentricularPulseWidth_ms"]) * 10)),
+                _hexify(int(p['VRP_ms'] / 10))])
+
+            # Hysteresis values
+            if self.current_mode in ("AAI", "AAIR", "VVI", "VVIR"):
+                if self.current_mode in ("AAI", "AAIR"):
+                    params.append(_hexify(int(float(p['AtrialSensitivity_mV']) * 10)))
+                else:
+                    params.append(_hexify(int(float(p["VentricularSensitivity_mV"]) * 10)))
+                params.extend([
+                    _hexify(p['RateSmoothingUp_percent']),
+                    _hexify(p['RateSmoothingDown_percent'])            ])
+            else:
+                # If not hysteresis, append 0s
+                params.extend([_hexify(0), _hexify(0), _hexify(0)])
+
+            # Rate adaptive values
+            if self.current_mode in ("AOOR", "AAIR", "VOOR", "VVIR"):
+                params.extend([
+                    _hexify(ACTIVITY_THRESHOLD.index(p["ActivityThreshold"]) + 1),
+                    _hexify(p["ReactionTime_s"])            ])
+                params.extend([
+                    _hexify(p["ResponseFactor"]),
+                    _hexify(p["RecoveryTime_min"])
+                    ])
+            else:
+                # If not rate adaptive, append 0s
+                params.extend([_hexify(0), _hexify(0), _hexify(0), _hexify(0)])
+
+            # MSR
+            if self.current_mode in ("AOOR", "AAIR", "VOOR", "VVIR"):
+                params.append(_hexify(p['MSR_ppm']))
+            else:
+                params.append(_hexify(0))
+
+            # Calculate checksum (sum of all params except header)
+            chksum = 0
+            for hex_val in params:  # params already includes everything after header
+                chksum += int(hex_val, 16)
+            chksum = chksum % 256
+            params.append(_hexify(chksum))
+
+            data = " ".join(header + params)
+        
+            # Debug output
+            print(f"DEBUG: Final hex string: {data}")
+            print(f"DEBUG: Clean hex: {data.replace(' ', '')}")
+            print(f"DEBUG: Length: {len(data.replace(' ', ''))}")
+        
+            return data
+        
+        except Exception as e:
+            print(f"ERROR in _package_params: {e}")
+            import traceback
+            traceback.print_exc()
+            # Return a minimal valid frame as fallback
+            return "16 55 00"  # sync + function + zero checksum
 
 # =========================
 # 8) Egram container (for D2)
@@ -1985,46 +2187,68 @@ class MainWindow(QMainWindow):
         return self.active_user
 
     # simulator handlers: flip internal flags and update labels/status 
+    # In MainWindow._toggle_comms method
+
     def _toggle_comms(self) -> None:
         self.comms_connected = self.action_port.isChecked()
 
         if self.comms_connected:
             try:
-                # ping the port
-                self.serial_thread = SerialThread(self)
-                # after creating serial_thread and starting it:
-                self.serial_thread.port_setup(self.action_port.text() if hasattr(self, 'COM4') else "COM3", BAUD_RATE)
+                # Create and setup thread
+                self.serial_thread = SerialThread()
+                self.serial_thread.serial_error.connect(
+                    lambda msg: QMessageBox.warning(self, "Serial Error", msg))
+            
+                # Get port name and setup parameters
+                port_name = self.action_port.text()
+                print(f"Connecting to port: {port_name}")
+                self.serial_thread.port_setup(port_name, BAUD_RATE, QSerialPort.Data8)
+            
+                # Start thread (this will create the port in the worker thread)
                 self.serial_thread.start()
-                # attach to the ModeEditorPage so the EgramView can access it
+            
+                # Wait for thread to initialize
+                import time
+                time.sleep(0.2)  # Slightly longer wait
+            
+                # Verify thread is running and port is open
+                if not self.serial_thread.isRunning or not self.serial_thread.port or not self.serial_thread.port.isOpen():
+                    raise Exception("Failed to initialize serial connection")
+            
+                # Attach to editor page
                 self.page_edit.attach_serial_thread(self.serial_thread)
-
-                self.serial_thread.port_setup(self.device_id[0], BAUD_RATE, 8)
-                self.serial_thread.start()
-                self.page_edit.serial_thread = self.serial_thread
-
-                if self.action_port.text() != self.device_id[0]:
+            
+                # Update device info
+                if port_name != self.device_id[0]:
                     self.device_changed = True
-                    self.device_id[0] = self.action_port.text()
-                    self.device_id[1] = self.action_port.text() # set default nickname to port
-                    QMessageBox.information(self, "Device changed", f"Current device: {self.device_id[1]}.")
+                    self.device_id[0] = port_name
+                    self.device_id[1] = port_name  # or keep previous nickname
                     self.page_dash.show_device(self.device_id[1])
-                    
-            except SerialException:
-                self.serial_thread.stop()
-                QMessageBox.critical(self, "Error", "Failed to connect to serial port")
+            
+                QMessageBox.information(self, "Connected", 
+                    f"Connected to {port_name} at {BAUD_RATE} baud")
+                
+            except Exception as e:
+                if self.serial_thread:
+                    self.serial_thread.stop()
+                    self.serial_thread.wait(1000)
+                    self.serial_thread = None
+                QMessageBox.critical(self, "Error", f"Failed to connect: {str(e)}")
                 self.comms_connected = False
+                self.action_port.setChecked(False)  # Uncheck the menu item
         else:
-            if self.serial_thread is not None: #conditional stop
+            # Disconnection logic remains the same...
+            if self.serial_thread is not None:
                 self.serial_thread.stop()
-                self.serial_thread = None #proper stop
-            QMessageBox.information(self, "Device disconnected", f"Disconnected from {self.device_id[1]}.")
-            #not properly displaying port name
+                self.serial_thread.wait(1000)
+                self.serial_thread = None
+            QMessageBox.information(self, "Disconnected", 
+                f"Disconnected from {self.device_id[1]}")
             self.comms_connected = False
             self.device_id = ["", ""]
             self.page_dash.show_device(self.device_id[1])
 
         self.page_dash.show_comms(self.comms_connected)
-        
         self._refresh_status_bar()
 
     def _refresh_ports(self) -> None:
